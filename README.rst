@@ -13,10 +13,12 @@ Current Status:
 
 Right now, current implementation is being tested by booting the MPE/iX which expects to see a tape after modification to seabios-hppa by Helge Deller to support booting from a tape. It is being tested on an emulated HP A400 and HP B160L machines. It HARD Booted successfully but hits a SeaBios trap #9, at 0x0:0x11700, IIR=0x0, IOR addr=0x0:0x0 cause the wrong data is read from the virtual tape after boot 
 
-seabios tape support branch:
-============================ https://github.com/hdeller/seabios-hppa/tree/devel-tape
+Seabios tape support branch:
+============================
+ https://github.com/hdeller/seabios-hppa/tree/devel-tape
 
-build:
+Build:
+======
 .. code-block:: shell
 ./build/qemu-system-hppa -drive file=MPE75SLT.std,if=none,id=tape0,format=raw -device scsi-tape,drive=tape0 -nographic -smp cpus=1 -snapshot -bios ../seabios-hppa/out/hppa-firmware.img
 
