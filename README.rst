@@ -29,7 +29,7 @@ Fix:
 
 Todo:
 =====
-- Implement other SCSI commands
+- Implement other SCSI commands [REQUEST SENSE, WRITE, WRITE FILEMARKS, SPACE, READ POSITION, MODE SENSE]
 - Make it work with Linux utils like tar and mt
 - Testing and Documentation 
 
