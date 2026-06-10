@@ -1,4 +1,4 @@
-SCSI Tape Emulation Support for QEMU
+## SCSI Tape Emulation Support for QEMU
 
 The project was proposed during GSoC 2026 but there were not enough slots allocated.
 
