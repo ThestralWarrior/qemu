@@ -1,4 +1,4 @@
-## SCSI Tape Emulation Support for QEMU
+SCSI Tape Emulation Support for QEMU
 
 The project was proposed during GSoC 2026 but there were not enough slots allocated.
 
@@ -14,7 +14,7 @@ Right now, current implementation is being tested by booting the MPE/iX which ex
 seabios tape support branch:
  https://github.com/hdeller/seabios-hppa/tree/devel-tape
 
-## build:
+build:
 
 ./build/qemu-system-hppa -drive file=MPE75SLT.std,if=none,id=tape0,format=raw -device scsi-tape,drive=tape0 -nographic -smp cpus=1 -snapshot -bios ../seabios-hppa/out/hppa-firmware.img
 
