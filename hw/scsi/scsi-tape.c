@@ -16,6 +16,7 @@
 #include "hw/scsi/scsi.h"
 #include "qemu/hw-version.h"
 #include "qemu/memalign.h"
+#include "qemu/bswap.h"
 #include "scsi/constants.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -29,6 +30,7 @@
 #define TYPE_SCSI_TAPE_BASE      "scsi-tape"
 
 #define SCSI_MAX_INQUIRY_LEN     256
+#define SCSI_TAPE_BLOCK_SIZE     512
 
 OBJECT_DECLARE_TYPE(SCSITapeState, SCSITapeClass, SCSI_TAPE_BASE)
 
@@ -51,6 +53,7 @@ typedef struct SCSITapeState {
     bool eof;
     bool bot;
     bool eot;
+    bool loaded;
     char *vendor;
     char *version;
     char *serial;
@@ -219,6 +222,106 @@ static int scsi_tape_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
     return buflen;
 }
 
+static int scsi_tape_mode_sense_page(SCSITapeState *s, uint8_t page,
+                                     uint8_t page_control, uint8_t **p_outbuf)
+{
+    uint8_t *outbuf = *p_outbuf;
+
+    switch (page) {
+    case MODE_PAGE_R_W_ERROR:
+        outbuf[0] = page;
+        outbuf[1] = 0x0a;
+        if (page_control != 1) {
+            outbuf[2] = 0x80; /* Automatic write reallocation enabled */
+        }
+        *p_outbuf += 12;
+        return 12;
+
+    case MODE_PAGE_CONTROL:
+        outbuf[0] = page;
+        outbuf[1] = 0x0a;
+        if (page_control != 1) {
+            outbuf[3] = s->qdev.default_scsi_version >= 3 ? 0x10 : 0x00;
+        }
+        *p_outbuf += 12;
+        return 12;
+
+    default:
+        return -1;
+    }
+}
+
+static int scsi_tape_emulate_mode_sense(SCSIRequest *req, uint8_t *outbuf)
+{
+    SCSITapeState *s = DO_UPCAST(SCSITapeState, qdev, req->dev);
+    bool dbd = req->cmd.buf[1] & 0x08;
+    bool mode_sense_10 = req->cmd.buf[0] == MODE_SENSE_10;
+    uint8_t page = req->cmd.buf[2] & 0x3f;
+    uint8_t page_control = (req->cmd.buf[2] & 0xc0) >> 6;
+    uint8_t dev_specific_param = blk_is_writable(s->qdev.conf.blk) ? 0 : 0x80;
+    uint8_t *p;
+    int header_len = mode_sense_10 ? 8 : 4;
+    int block_desc_len = dbd ? 0 : 8;
+    int page_len;
+
+    if (page_control == 3) {
+        return -1;
+    }
+
+    p = outbuf + header_len;
+
+    if (!dbd) {
+        p[0] = 0; /* default density */
+        p[5] = (s->qdev.blocksize >> 16) & 0xff;
+        p[6] = (s->qdev.blocksize >> 8) & 0xff;
+        p[7] = s->qdev.blocksize & 0xff;
+        p += block_desc_len;
+    }
+
+    if (page == MODE_PAGE_ALLS) {
+        page_len = scsi_tape_mode_sense_page(s, MODE_PAGE_R_W_ERROR,
+                                             page_control, &p);
+        if (page_len < 0) {
+            return -1;
+        }
+        page_len = scsi_tape_mode_sense_page(s, MODE_PAGE_CONTROL,
+                                             page_control, &p);
+        if (page_len < 0) {
+            return -1;
+        }
+    } else {
+        page_len = scsi_tape_mode_sense_page(s, page, page_control, &p);
+        if (page_len < 0) {
+            return -1;
+        }
+    }
+
+    if (mode_sense_10) {
+        stw_be_p(outbuf, p - outbuf - 2);
+        outbuf[2] = 0; /* medium type */
+        outbuf[3] = dev_specific_param;
+        stw_be_p(&outbuf[6], block_desc_len);
+    } else {
+        outbuf[0] = p - outbuf - 1;
+        outbuf[1] = 0; /* medium type */
+        outbuf[2] = dev_specific_param;
+        outbuf[3] = block_desc_len;
+    }
+
+    return p - outbuf;
+}
+
+static void scsi_tape_emulate_load_unload(SCSIRequest *req)
+{
+    SCSITapeState *s = DO_UPCAST(SCSITapeState, qdev, req->dev);
+    bool load = req->cmd.buf[4] & 0x01;
+
+    s->loaded = load;
+    if (!load) {
+        scsi_tape_emulate_rewind(req);
+    }
+}
+
 static int32_t scsi_tape_emulate_command(SCSIRequest *req, uint8_t *buf)
 {
     SCSITapeReq *r = DO_UPCAST(SCSITapeReq, req, req);
@@ -229,11 +332,14 @@ static int32_t scsi_tape_emulate_command(SCSIRequest *req, uint8_t *buf)
     case TEST_UNIT_READY:
     case INQUIRY:
     case REWIND:
+    case LOAD_UNLOAD:
+    case MODE_SENSE:
+    case MODE_SENSE_10:
     case READ_6:
     case READ_10:
         break;
     default:
-        if (!blk_is_available(s->qdev.conf.blk)) {
+        if (!blk_is_available(s->qdev.conf.blk) || !s->loaded) {
             scsi_check_condition(r, SENSE_CODE(NO_MEDIUM));
             return 0;
         }
@@ -255,7 +361,10 @@ static int32_t scsi_tape_emulate_command(SCSIRequest *req, uint8_t *buf)
 
     switch (req->cmd.buf[0]) {
     case TEST_UNIT_READY:
-        assert(blk_is_available(s->qdev.conf.blk));
+        if (!blk_is_available(s->qdev.conf.blk) || !s->loaded) {
+            scsi_check_condition(r, SENSE_CODE(NO_MEDIUM));
+            return 0;
+        }
         break;
     case INQUIRY:
         buflen = scsi_tape_emulate_inquiry(req, outbuf);
@@ -267,6 +376,18 @@ static int32_t scsi_tape_emulate_command(SCSIRequest *req, uint8_t *buf)
         scsi_tape_emulate_rewind(req);
         scsi_req_complete(&r->req, GOOD);
         return 0;
+    case LOAD_UNLOAD:
+        scsi_tape_emulate_load_unload(req);
+        scsi_req_complete(&r->req, GOOD);
+        return 0;
+    case MODE_SENSE:
+    case MODE_SENSE_10:
+        buflen = scsi_tape_emulate_mode_sense(req, outbuf);
+        if (buflen < 0) {
+            goto illegal_request;
+        }
+        r->iov.iov_len = MIN((size_t)buflen, req->cmd.xfer);
+        return r->iov.iov_len;
     /* Read from given tape device */
     case READ_6:
     {
@@ -351,6 +472,7 @@ static void scsi_tape_init(SCSITapeState *s)
     s->eof = false;
     s->bot = true;
     s->eot = false;
+    s->loaded = true;
 }
 
 
@@ -359,6 +481,7 @@ static void scsi_tape_realize(SCSIDevice *dev, Error **errp)
     SCSITapeState *s = DO_UPCAST(SCSITapeState, qdev, dev);
 
     s->qdev.type = TYPE_TAPE;
+    s->qdev.blocksize = SCSI_TAPE_BLOCK_SIZE;
 
     if (!s->qdev.conf.blk) {
         error_setg(errp, "drive property not set");
@@ -435,6 +558,9 @@ static const SCSIReqOps *const scsi_tape_reqops_dispatch[256] = {
     [TEST_UNIT_READY]                 = &scsi_tape_emulate_reqops,
     [INQUIRY]                         = &scsi_tape_emulate_reqops,
     [REWIND]                          = &scsi_tape_emulate_reqops,
+    [LOAD_UNLOAD]                     = &scsi_tape_emulate_reqops,
+    [MODE_SENSE]                      = &scsi_tape_emulate_reqops,
+    [MODE_SENSE_10]                   = &scsi_tape_emulate_reqops,
     [READ_6]                          = &scsi_tape_emulate_reqops,
     [READ_10]                         = &scsi_tape_emulate_reqops,
 };
